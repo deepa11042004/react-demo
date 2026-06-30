@@ -1,0 +1,4 @@
+/* App-level resets — component styles are scoped per file */
+main {
+  flex: 1;
+}
