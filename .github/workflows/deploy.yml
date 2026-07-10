@@ -110,6 +110,9 @@ jobs:
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --parameters "commands=[
+              \"echo 'Waiting for Docker to be ready...' \",
+              \"until docker info > /dev/null 2>&1; do sleep 5; done\",
+              \"echo 'Docker is ready'\",
               \"docker pull $IMAGE\",
               \"docker stop react-demo || true\",
               \"docker rm react-demo || true\",
