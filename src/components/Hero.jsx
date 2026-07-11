@@ -16,7 +16,7 @@ export default function Hero() {
         </div>
 
         <h1 className="hero-title">
-          Build products that<br />
+          Build and start<br />
           <span className="gradient-text">people love to use</span>
         </h1>
 
