@@ -144,7 +144,7 @@ Resources:
     Properties:
       # Latest Amazon Linux 2 AMI — resolved automatically per region
       ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
-      InstanceType: t2.small
+      InstanceType: t2.micro
       IamInstanceProfile: !Ref EC2InstanceProfile
       KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
       NetworkInterfaces:
