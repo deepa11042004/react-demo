@@ -12,6 +12,11 @@ Parameters:
     Type: String
     Description: "Docker Hub image to run on first boot (e.g. yourname/react-demo:latest)"
 
+  CertbotEmail:
+    Type: String
+    Default: peltowninfra@gmail.com
+    Description: "Email for Let's Encrypt certificate expiry notifications"
+
   KeyPairName:
     Type: String
     Default: ''
@@ -100,6 +105,11 @@ Resources:
           CidrIp: 0.0.0.0/0
           Description: HTTP
         - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS
+        - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
           CidrIp: 0.0.0.0/0
@@ -127,6 +137,17 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: CertbotRoute53Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - route53:ListHostedZones
+                  - route53:GetChange
+                  - route53:ChangeResourceRecordSets
+                Resource: '*'
       Tags:
         - Key: Name
           Value: react-demo-ec2-role
@@ -161,22 +182,71 @@ Resources:
           # Update system
           yum update -y
 
-          # Install Docker
+          # ── Install Docker ────────────────────────────
           amazon-linux-extras install docker -y
           systemctl start docker
           systemctl enable docker
           usermod -aG docker ec2-user
 
-          # Pull image from Docker Hub and run
+          # Run Docker container on port 8080 (nginx on host handles 80/443)
           docker pull ${DockerImage}
-
           docker run -d \
             --name react-demo \
-            -p 80:80 \
+            -p 8080:80 \
             --restart unless-stopped \
             ${DockerImage}
 
-          echo "✅ react-demo container started"
+          # ── Install nginx on host ─────────────────────
+          amazon-linux-extras install nginx1 -y
+          systemctl enable nginx
+
+          # ── Install Certbot with Route53 DNS plugin ───
+          yum install -y python3-pip
+          pip3 install certbot certbot-dns-route53
+
+          # Obtain SSL cert via Route53 DNS-01 challenge
+          # (DNS challenge means no HTTP dependency — works even before traffic flows)
+          certbot certonly \
+            --dns-route53 \
+            --non-interactive \
+            --agree-tos \
+            --email ${CertbotEmail} \
+            -d react-demo.bserc.org \
+            --dns-route53-propagation-seconds 60
+
+          # ── Configure nginx as SSL reverse proxy ──────
+          cat > /etc/nginx/conf.d/react-demo.conf << 'NGINXEOF'
+          server {
+              listen 80;
+              server_name react-demo.bserc.org;
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen 443 ssl;
+              server_name react-demo.bserc.org;
+
+              ssl_certificate /etc/letsencrypt/live/react-demo.bserc.org/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/react-demo.bserc.org/privkey.pem;
+              ssl_protocols TLSv1.2 TLSv1.3;
+              ssl_prefer_server_ciphers on;
+
+              location / {
+                  proxy_pass http://127.0.0.1:8080;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+          NGINXEOF
+
+          systemctl start nginx
+
+          # ── Auto-renew cert daily at 3am ──────────────
+          echo "0 3 * * * root certbot renew --quiet && systemctl reload nginx" >> /etc/crontab
+
+          echo "✅ react-demo live on https"
       Tags:
         - Key: Name
           Value: react-demo-server
@@ -212,7 +282,7 @@ Outputs:
 
   WebsiteURL:
     Description: Public URL of the website
-    Value: http://react-demo.bserc.org
+    Value: https://react-demo.bserc.org
 
   PublicIP:
     Description: Elastic IP address

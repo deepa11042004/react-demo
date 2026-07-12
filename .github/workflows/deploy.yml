@@ -115,7 +115,7 @@ jobs:
               \"docker pull $IMAGE\",
               \"docker stop react-demo || true\",
               \"docker rm react-demo || true\",
-              \"docker run -d --name react-demo -p 80:80 --restart unless-stopped $IMAGE\",
+              \"docker run -d --name react-demo -p 8080:80 --restart unless-stopped $IMAGE\",
               \"echo Container started successfully\"
             ]" \
             --comment "Deploy ${{ github.sha }}" \
