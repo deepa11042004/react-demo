@@ -193,6 +193,18 @@ Resources:
         - Key: Name
           Value: react-demo-eip
 
+  # ── Route53 A Record ─────────────────────────
+
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: Z01291282OIN72SISEYSR
+      Name: react-demo.bserc.org
+      Type: A
+      TTL: '60'
+      ResourceRecords:
+        - !Ref ElasticIP
+
 # ─────────────────────────────────────────────
 # Outputs
 # ─────────────────────────────────────────────
@@ -200,7 +212,7 @@ Outputs:
 
   WebsiteURL:
     Description: Public URL of the website
-    Value: !Sub 'http://${ElasticIP}'
+    Value: http://react-demo.bserc.org
 
   PublicIP:
     Description: Elastic IP address
