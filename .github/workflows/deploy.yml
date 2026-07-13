@@ -7,8 +7,9 @@ on:
 
 env:
   DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/react-demo
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  STACK_NAME: react-demo-stack
+  AWS_REGION:   ${{ secrets.AWS_REGION }}
+  STACK_NAME:   react-demo-stack
+  DOMAIN:       react-demo.bserc.org
 
 jobs:
   deploy:
@@ -46,9 +47,9 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region:            ${{ env.AWS_REGION }}
 
       # ── 4. Deploy / update CloudFormation stack ──────────
       - name: Deploy CloudFormation stack
@@ -87,12 +88,12 @@ jobs:
             echo "Attempt $i — SSM status: $STATUS"
 
             if [ "$STATUS" = "Online" ]; then
-              echo "✅ SSM agent is online"
+              echo "SSM agent is online"
               break
             fi
 
             if [ "$i" = "20" ]; then
-              echo "❌ SSM agent did not come online in time"
+              echo "SSM agent did not come online in time"
               exit 1
             fi
 
@@ -104,55 +105,56 @@ jobs:
         run: |
           INSTANCE_ID="${{ steps.get-instance.outputs.instance_id }}"
           IMAGE="${{ env.DOCKER_IMAGE }}:latest"
+          CERT_PATH="/etc/letsencrypt/live/${{ env.DOMAIN }}/fullchain.pem"
+
+          # Poll an SSM command until it finishes or fails.
+          # Usage: poll_ssm <command-id> <max-attempts> <sleep-seconds>
+          poll_ssm() {
+            local CMD_ID="$1" MAX="$2" SLEEP="$3"
+            for i in $(seq 1 "$MAX"); do
+              STATUS=$(aws ssm get-command-invocation \
+                --command-id "$CMD_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'Status' \
+                --output text 2>/dev/null || echo "Pending")
+
+              echo "  Attempt $i — $STATUS"
+
+              if [ "$STATUS" = "Success" ]; then return 0; fi
+
+              if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardErrorContent' --output text
+                return 1
+              fi
+
+              [ "$i" = "$MAX" ] && return 1
+              sleep "$SLEEP"
+            done
+          }
 
           # ── 7a. Run initial setup if SSL cert is missing ──
-          # cloud-init sometimes skips UserData due to a stale semaphore in the AMI.
-          # Check for the SSL cert (not just nginx) so we re-run setup if certbot
-          # failed on a previous attempt even though nginx was already installed.
+          # Amazon Linux 2 AMIs carry a stale cloud-init semaphore that causes
+          # UserData to be skipped on new instances. We detect incomplete setup
+          # by checking for the SSL cert and force-run the saved UserData script
+          # (part-001) via SSM if needed, bypassing cloud-init entirely.
           echo "Checking whether initial setup is complete..."
           SETUP_CMD=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 900 \
-            --parameters 'commands=[
-              "if [ -f /etc/letsencrypt/live/react-demo.bserc.org/fullchain.pem ]; then echo SETUP_DONE; exit 0; fi; echo SETUP_NEEDED; IID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id); rm -f /var/lib/cloud/instances/$IID/sem/config-scripts-user; bash /var/lib/cloud/instance/scripts/part-001"
-            ]' \
+            --parameters "commands=[
+              \"if [ -f $CERT_PATH ]; then echo SETUP_DONE; exit 0; fi; echo SETUP_NEEDED; IID=\$(curl -s http://169.254.169.254/latest/meta-data/instance-id); rm -f /var/lib/cloud/instances/\$IID/sem/config-scripts-user; bash /var/lib/cloud/instance/scripts/part-001\"
+            ]" \
             --comment "Setup check ${{ github.sha }}" \
             --query 'Command.CommandId' \
             --output text)
 
           echo "Setup command ID: $SETUP_CMD"
-
-          for i in $(seq 1 60); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$SETUP_CMD" \
-              --instance-id "$INSTANCE_ID" \
-              --query 'Status' \
-              --output text 2>/dev/null || echo "Pending")
-
-            echo "Attempt $i — Setup status: $STATUS"
-
-            if [ "$STATUS" = "Success" ]; then
-              echo "✅ Setup complete"
-              break
-            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
-              echo "❌ Setup failed with status: $STATUS"
-              aws ssm get-command-invocation \
-                --command-id "$SETUP_CMD" \
-                --instance-id "$INSTANCE_ID" \
-                --query 'StandardOutputContent' \
-                --output text
-              aws ssm get-command-invocation \
-                --command-id "$SETUP_CMD" \
-                --instance-id "$INSTANCE_ID" \
-                --query 'StandardErrorContent' \
-                --output text
-              exit 1
-            fi
-
-            [ "$i" = "60" ] && { echo "❌ Setup timed out after 15 min"; exit 1; }
-            sleep 15
-          done
+          poll_ssm "$SETUP_CMD" 60 15 || { echo "Setup failed"; exit 1; }
+          echo "Setup complete"
 
           # ── 7b. Pull latest image and restart container ────
           echo "Updating Docker container..."
@@ -173,32 +175,8 @@ jobs:
             --output text)
 
           echo "Update command ID: $UPDATE_CMD"
-
-          for i in $(seq 1 24); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$UPDATE_CMD" \
-              --instance-id "$INSTANCE_ID" \
-              --query 'Status' \
-              --output text 2>/dev/null || echo "Pending")
-
-            echo "Attempt $i — Update status: $STATUS"
-
-            if [ "$STATUS" = "Success" ]; then
-              echo "✅ Container updated"
-              break
-            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
-              echo "❌ Container update failed"
-              aws ssm get-command-invocation \
-                --command-id "$UPDATE_CMD" \
-                --instance-id "$INSTANCE_ID" \
-                --query 'StandardErrorContent' \
-                --output text
-              exit 1
-            fi
-
-            [ "$i" = "24" ] && { echo "❌ Timed out waiting for container update"; exit 1; }
-            sleep 5
-          done
+          poll_ssm "$UPDATE_CMD" 24 5 || { echo "Container update failed"; exit 1; }
+          echo "Container updated"
 
       # ── 8. Print live URL ─────────────────────────────────
       - name: Print website URL
@@ -207,7 +185,4 @@ jobs:
             --stack-name ${{ env.STACK_NAME }} \
             --query 'Stacks[0].Outputs[?OutputKey==`WebsiteURL`].OutputValue' \
             --output text)
-          echo ""
-          echo "🚀 Deployment complete!"
-          echo "🌐 Website live at: $URL"
-          echo ""
+          echo "Deployment complete — $URL"

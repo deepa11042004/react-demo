@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   React Demo — Full infrastructure stack.
-  Creates VPC, public subnet, EC2 instance with Docker, Elastic IP, and IAM role for SSM.
+  Creates VPC, public subnet, EC2 (Docker + nginx + Let's Encrypt SSL),
+  Elastic IP, IAM role for SSM and Route53, and a DNS A record.
 
 # ─────────────────────────────────────────────
 # Parameters
@@ -10,17 +11,32 @@ Parameters:
 
   DockerImage:
     Type: String
-    Description: "Docker Hub image to run on first boot (e.g. yourname/react-demo:latest)"
+    Description: "Docker Hub image to deploy (passed by GitHub Actions CI/CD)"
+
+  DomainName:
+    Type: String
+    Default: react-demo.bserc.org
+    Description: "Subdomain for the website (must belong to the HostedZoneId zone)"
+
+  HostedZoneId:
+    Type: String
+    Default: Z01291282OIN72SISEYSR
+    Description: "Route53 Hosted Zone ID for the parent domain"
 
   CertbotEmail:
     Type: String
     Default: peltowninfra@gmail.com
-    Description: "Email for Let's Encrypt certificate expiry notifications"
+    Description: "Email address for Let's Encrypt certificate expiry notifications"
+
+  InstanceType:
+    Type: String
+    Default: t2.small
+    Description: "EC2 instance type"
 
   KeyPairName:
     Type: String
     Default: ''
-    Description: "EC2 Key Pair name for SSH access (leave empty to skip — SSM is used for deployments)"
+    Description: "EC2 Key Pair for SSH access (optional — SSM is preferred for deployments)"
 
 # ─────────────────────────────────────────────
 # Conditions
@@ -96,7 +112,7 @@ Resources:
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTP and SSH inbound traffic
+      GroupDescription: Allow HTTP, HTTPS and SSH inbound traffic
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -122,7 +138,10 @@ Resources:
         - Key: Name
           Value: react-demo-sg
 
-  # ── IAM Role (SSM access only — no ECR needed) ──
+  # ── IAM Role ─────────────────────────────────
+  # Grants the EC2 instance:
+  #   • SSM core access  — so GitHub Actions can run remote commands without SSH
+  #   • Route53 access   — so Certbot can complete the DNS-01 challenge for SSL
 
   EC2Role:
     Type: AWS::IAM::Role
@@ -163,9 +182,8 @@ Resources:
   EC2Instance:
     Type: AWS::EC2::Instance
     Properties:
-      # Latest Amazon Linux 2 AMI — resolved automatically per region
       ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
-      InstanceType: t2.small
+      InstanceType: !Ref InstanceType
       IamInstanceProfile: !Ref EC2InstanceProfile
       KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
       NetworkInterfaces:
@@ -181,18 +199,18 @@ Resources:
 
           echo "=== START: $(date) ==="
 
-          # ── Update system ─────────────────────────────
+          # ── Update system ──────────────────────────────
           echo ">>> yum update"
           yum update -y
 
-          # ── Install Docker ────────────────────────────
+          # ── Install Docker ─────────────────────────────
           echo ">>> install docker"
           amazon-linux-extras install docker -y
           systemctl start docker
           systemctl enable docker
           usermod -aG docker ec2-user
 
-          # ── Run Docker container on port 8080 ─────────
+          # ── Pull and start the application container ───
           echo ">>> docker pull and run"
           docker pull ${DockerImage}
           docker stop react-demo || true
@@ -203,40 +221,42 @@ Resources:
             --restart unless-stopped \
             ${DockerImage}
 
-          # ── Install nginx ─────────────────────────────
+          # ── Install nginx ──────────────────────────────
           echo ">>> install nginx"
           amazon-linux-extras install nginx1 -y
           systemctl enable nginx
 
-          # ── Install Certbot ───────────────────────────
+          # ── Install Certbot ────────────────────────────
+          # urllib3 pinned to <1.27: Python 3.7 on Amazon Linux 2 uses
+          # OpenSSL 1.0.2k which is incompatible with urllib3 v2.x
           echo ">>> install certbot"
           amazon-linux-extras install epel -y
           yum install -y python3
           python3 -m pip install certbot certbot-dns-route53 "urllib3>=1.25.4,<1.27"
 
-          # ── Get SSL certificate via DNS-01 challenge ──
+          # ── Obtain SSL certificate via Route53 DNS-01 challenge ──
           echo ">>> run certbot"
           certbot certonly \
             --dns-route53 \
             --non-interactive \
             --agree-tos \
             --email ${CertbotEmail} \
-            -d react-demo.bserc.org \
+            -d ${DomainName} \
             --dns-route53-propagation-seconds 60
 
-          # ── Configure nginx as SSL reverse proxy ──────
+          # ── Configure nginx as SSL reverse proxy ───────
           echo ">>> configure nginx"
           cat > /etc/nginx/conf.d/react-demo.conf << 'NGINXEOF'
           server {
               listen 80;
-              server_name react-demo.bserc.org;
+              server_name ${DomainName};
               return 301 https://$host$request_uri;
           }
           server {
               listen 443 ssl;
-              server_name react-demo.bserc.org;
-              ssl_certificate /etc/letsencrypt/live/react-demo.bserc.org/fullchain.pem;
-              ssl_certificate_key /etc/letsencrypt/live/react-demo.bserc.org/privkey.pem;
+              server_name ${DomainName};
+              ssl_certificate /etc/letsencrypt/live/${DomainName}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/${DomainName}/privkey.pem;
               ssl_protocols TLSv1.2 TLSv1.3;
               ssl_prefer_server_ciphers on;
               location / {
@@ -252,7 +272,7 @@ Resources:
           nginx -t
           systemctl restart nginx
 
-          # ── Auto-renew cert daily at 3am ──────────────
+          # ── Schedule daily certificate renewal ─────────
           echo "0 3 * * * root certbot renew --quiet && systemctl reload nginx" >> /etc/crontab
 
           echo "=== DONE: $(date) ==="
@@ -277,8 +297,8 @@ Resources:
   DNSRecord:
     Type: AWS::Route53::RecordSet
     Properties:
-      HostedZoneId: Z01291282OIN72SISEYSR
-      Name: react-demo.bserc.org
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
       Type: A
       TTL: '60'
       ResourceRecords:
@@ -290,15 +310,15 @@ Resources:
 Outputs:
 
   WebsiteURL:
-    Description: Public URL of the website
-    Value: https://react-demo.bserc.org
+    Description: Public HTTPS URL of the website
+    Value: !Sub 'https://${DomainName}'
 
   PublicIP:
     Description: Elastic IP address
     Value: !Ref ElasticIP
 
   InstanceId:
-    Description: EC2 Instance ID (used by GitHub Actions SSM commands)
+    Description: EC2 Instance ID (used by GitHub Actions for SSM commands)
     Value: !Ref EC2Instance
     Export:
       Name: ReactDemoInstanceId
