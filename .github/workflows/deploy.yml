@@ -105,16 +105,17 @@ jobs:
           INSTANCE_ID="${{ steps.get-instance.outputs.instance_id }}"
           IMAGE="${{ env.DOCKER_IMAGE }}:latest"
 
-          # ── 7a. Run initial setup if nginx is missing ─────
+          # ── 7a. Run initial setup if SSL cert is missing ──
           # cloud-init sometimes skips UserData due to a stale semaphore in the AMI.
-          # We detect this by checking for nginx, then force-run part-001 via SSM.
+          # Check for the SSL cert (not just nginx) so we re-run setup if certbot
+          # failed on a previous attempt even though nginx was already installed.
           echo "Checking whether initial setup is complete..."
           SETUP_CMD=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 900 \
             --parameters 'commands=[
-              "if command -v nginx > /dev/null 2>&1; then echo SETUP_DONE; exit 0; fi; echo SETUP_NEEDED; IID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id); rm -f /var/lib/cloud/instances/$IID/sem/config-scripts-user; bash /var/lib/cloud/instance/scripts/part-001"
+              "if [ -f /etc/letsencrypt/live/react-demo.bserc.org/fullchain.pem ]; then echo SETUP_DONE; exit 0; fi; echo SETUP_NEEDED; IID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id); rm -f /var/lib/cloud/instances/$IID/sem/config-scripts-user; bash /var/lib/cloud/instance/scripts/part-001"
             ]' \
             --comment "Setup check ${{ github.sha }}" \
             --query 'Command.CommandId' \
