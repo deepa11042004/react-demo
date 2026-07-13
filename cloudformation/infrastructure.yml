@@ -177,8 +177,6 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          # Log everything to cloud-init-output.log AND a dedicated file
-          exec > >(tee -a /var/log/userdata.log) 2>&1
           set -ex
 
           echo "=== START: $(date) ==="
