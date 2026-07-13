@@ -2,10 +2,10 @@ import { useState, useEffect } from 'react'
 import './Stats.css'
 
 const FALLBACK = [
-  { value: '12K+',  label: 'Teams using Nexus' },
-  { value: '99.9%', label: 'Uptime guarantee' },
-  { value: '4.9★',  label: 'Average rating' },
-  { value: '3min',  label: 'Average setup time' },
+  { value: '0K+',  label: 'Teams using Nexus' },
+  { value: '0%', label: 'Uptime guarantee' },
+  { value: '0★',  label: 'Average rating' },
+  { value: '0min',  label: 'Average setup time' },
 ]
 
 function formatStat(key, val) {
