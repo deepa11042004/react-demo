@@ -38,6 +38,11 @@ Parameters:
     Default: api.react-demo.bserc.org
     Description: "Subdomain for the backend API"
 
+  AnalyticsDomainName:
+    Type: String
+    Default: analytics.react-demo.bserc.org
+    Description: "Subdomain for the analytics service"
+
   KeyPairName:
     Type: String
     Default: ''
@@ -258,12 +263,21 @@ Resources:
             -d ${BackendDomainName} \
             --dns-route53-propagation-seconds 60
 
+          echo ">>> run certbot (analytics)"
+          certbot certonly \
+            --dns-route53 \
+            --non-interactive \
+            --agree-tos \
+            --email ${CertbotEmail} \
+            -d ${AnalyticsDomainName} \
+            --dns-route53-propagation-seconds 60
+
           # ── Configure nginx as SSL reverse proxy ───────
           echo ">>> configure nginx"
           cat > /etc/nginx/conf.d/react-demo.conf << 'NGINXEOF'
           server {
               listen 80;
-              server_name ${DomainName} ${BackendDomainName};
+              server_name ${DomainName} ${BackendDomainName} ${AnalyticsDomainName};
               return 301 https://$host$request_uri;
           }
           server {
@@ -290,6 +304,21 @@ Resources:
               ssl_prefer_server_ciphers on;
               location / {
                   proxy_pass http://127.0.0.1:3001;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+          server {
+              listen 443 ssl;
+              server_name ${AnalyticsDomainName};
+              ssl_certificate /etc/letsencrypt/live/${AnalyticsDomainName}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/${AnalyticsDomainName}/privkey.pem;
+              ssl_protocols TLSv1.2 TLSv1.3;
+              ssl_prefer_server_ciphers on;
+              location / {
+                  proxy_pass http://127.0.0.1:3002;
                   proxy_set_header Host $host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -338,6 +367,16 @@ Resources:
     Properties:
       HostedZoneId: !Ref HostedZoneId
       Name: !Ref BackendDomainName
+      Type: A
+      TTL: '60'
+      ResourceRecords:
+        - !Ref ElasticIP
+
+  DNSRecordAnalytics:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref AnalyticsDomainName
       Type: A
       TTL: '60'
       ResourceRecords:
