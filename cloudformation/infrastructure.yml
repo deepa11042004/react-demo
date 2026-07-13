@@ -33,6 +33,11 @@ Parameters:
     Default: t2.small
     Description: "EC2 instance type"
 
+  BackendDomainName:
+    Type: String
+    Default: api.react-demo.bserc.org
+    Description: "Subdomain for the backend API"
+
   KeyPairName:
     Type: String
     Default: ''
@@ -234,8 +239,8 @@ Resources:
           yum install -y python3
           python3 -m pip install certbot certbot-dns-route53 "urllib3>=1.25.4,<1.27"
 
-          # ── Obtain SSL certificate via Route53 DNS-01 challenge ──
-          echo ">>> run certbot"
+          # ── Obtain SSL certificates via Route53 DNS-01 challenge ──
+          echo ">>> run certbot (frontend)"
           certbot certonly \
             --dns-route53 \
             --non-interactive \
@@ -244,12 +249,21 @@ Resources:
             -d ${DomainName} \
             --dns-route53-propagation-seconds 60
 
+          echo ">>> run certbot (backend)"
+          certbot certonly \
+            --dns-route53 \
+            --non-interactive \
+            --agree-tos \
+            --email ${CertbotEmail} \
+            -d ${BackendDomainName} \
+            --dns-route53-propagation-seconds 60
+
           # ── Configure nginx as SSL reverse proxy ───────
           echo ">>> configure nginx"
           cat > /etc/nginx/conf.d/react-demo.conf << 'NGINXEOF'
           server {
               listen 80;
-              server_name ${DomainName};
+              server_name ${DomainName} ${BackendDomainName};
               return 301 https://$host$request_uri;
           }
           server {
@@ -261,6 +275,21 @@ Resources:
               ssl_prefer_server_ciphers on;
               location / {
                   proxy_pass http://127.0.0.1:8080;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+          server {
+              listen 443 ssl;
+              server_name ${BackendDomainName};
+              ssl_certificate /etc/letsencrypt/live/${BackendDomainName}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/${BackendDomainName}/privkey.pem;
+              ssl_protocols TLSv1.2 TLSv1.3;
+              ssl_prefer_server_ciphers on;
+              location / {
+                  proxy_pass http://127.0.0.1:3001;
                   proxy_set_header Host $host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -292,13 +321,23 @@ Resources:
         - Key: Name
           Value: react-demo-eip
 
-  # ── Route53 A Record ─────────────────────────
+  # ── Route53 A Records ────────────────────────
 
   DNSRecord:
     Type: AWS::Route53::RecordSet
     Properties:
       HostedZoneId: !Ref HostedZoneId
       Name: !Ref DomainName
+      Type: A
+      TTL: '60'
+      ResourceRecords:
+        - !Ref ElasticIP
+
+  DNSRecordBackend:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref BackendDomainName
       Type: A
       TTL: '60'
       ResourceRecords:

@@ -9,7 +9,8 @@ env:
   DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/react-demo
   AWS_REGION:   ${{ secrets.AWS_REGION }}
   STACK_NAME:   react-demo-stack
-  DOMAIN:       react-demo.bserc.org
+  DOMAIN:         react-demo.bserc.org
+  BACKEND_DOMAIN: api.react-demo.bserc.org
 
 jobs:
   deploy:
@@ -106,6 +107,7 @@ jobs:
           INSTANCE_ID="${{ steps.get-instance.outputs.instance_id }}"
           IMAGE="${{ env.DOCKER_IMAGE }}:latest"
           CERT_PATH="/etc/letsencrypt/live/${{ env.DOMAIN }}/fullchain.pem"
+          BACKEND_CERT_PATH="/etc/letsencrypt/live/${{ env.BACKEND_DOMAIN }}/fullchain.pem"
 
           # Poll an SSM command until it finishes or fails.
           # Usage: poll_ssm <command-id> <max-attempts> <sleep-seconds>
@@ -146,7 +148,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 900 \
             --parameters "commands=[
-              \"if [ -f $CERT_PATH ]; then echo SETUP_DONE; exit 0; fi; echo SETUP_NEEDED; IID=\$(curl -s http://169.254.169.254/latest/meta-data/instance-id); rm -f /var/lib/cloud/instances/\$IID/sem/config-scripts-user; bash /var/lib/cloud/instance/scripts/part-001\"
+              \"if [ -f $CERT_PATH ] && [ -f $BACKEND_CERT_PATH ]; then echo SETUP_DONE; exit 0; fi; echo SETUP_NEEDED; IID=\$(curl -s http://169.254.169.254/latest/meta-data/instance-id); rm -f /var/lib/cloud/instances/\$IID/sem/config-scripts-user; bash /var/lib/cloud/instance/scripts/part-001\"
             ]" \
             --comment "Setup check ${{ github.sha }}" \
             --query 'Command.CommandId' \
