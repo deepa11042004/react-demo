@@ -212,7 +212,7 @@ Resources:
           echo ">>> install certbot"
           amazon-linux-extras install epel -y
           yum install -y python3
-          python3 -m pip install certbot certbot-dns-route53
+          python3 -m pip install certbot certbot-dns-route53 "urllib3>=1.25.4,<1.27"
 
           # ── Get SSL certificate via DNS-01 challenge ──
           echo ">>> run certbot"
