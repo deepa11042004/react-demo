@@ -99,54 +99,102 @@ jobs:
             sleep 15
           done
 
-      # ── 7. Pull new image and restart container via SSM ──
-      - name: Update container on EC2
+      # ── 7. Ensure full setup is done, then update container ──
+      - name: Setup and update container on EC2
         run: |
           INSTANCE_ID="${{ steps.get-instance.outputs.instance_id }}"
           IMAGE="${{ env.DOCKER_IMAGE }}:latest"
 
-          COMMAND_ID=$(aws ssm send-command \
+          # ── 7a. Run initial setup if nginx is missing ─────
+          # cloud-init sometimes skips UserData due to a stale semaphore in the AMI.
+          # We detect this by checking for nginx, then force-run part-001 via SSM.
+          echo "Checking whether initial setup is complete..."
+          SETUP_CMD=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --parameters "commands=[
-              \"echo 'Waiting for Docker to be ready...' \",
-              \"until docker info > /dev/null 2>&1; do sleep 5; done\",
-              \"echo 'Docker is ready'\",
-              \"docker pull $IMAGE\",
-              \"docker stop react-demo || true\",
-              \"docker rm react-demo || true\",
-              \"docker run -d --name react-demo -p 8080:80 --restart unless-stopped $IMAGE\",
-              \"echo Container started successfully\"
-            ]" \
-            --comment "Deploy ${{ github.sha }}" \
+            --timeout-seconds 900 \
+            --parameters 'commands=[
+              "if command -v nginx > /dev/null 2>&1; then echo SETUP_DONE; exit 0; fi; echo SETUP_NEEDED; IID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id); rm -f /var/lib/cloud/instances/$IID/sem/config-scripts-user; bash /var/lib/cloud/instance/scripts/part-001"
+            ]' \
+            --comment "Setup check ${{ github.sha }}" \
             --query 'Command.CommandId' \
             --output text)
 
-          echo "SSM Command ID: $COMMAND_ID"
+          echo "Setup command ID: $SETUP_CMD"
 
-          # Poll until the command completes
-          for i in $(seq 1 24); do
+          for i in $(seq 1 60); do
             STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
+              --command-id "$SETUP_CMD" \
               --instance-id "$INSTANCE_ID" \
               --query 'Status' \
               --output text 2>/dev/null || echo "Pending")
 
-            echo "Attempt $i — Command status: $STATUS"
+            echo "Attempt $i — Setup status: $STATUS"
 
             if [ "$STATUS" = "Success" ]; then
-              echo "✅ Container updated successfully"
+              echo "✅ Setup complete"
               break
             elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
-              echo "❌ SSM command failed with status: $STATUS"
+              echo "❌ Setup failed with status: $STATUS"
               aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
+                --command-id "$SETUP_CMD" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'StandardOutputContent' \
+                --output text
+              aws ssm get-command-invocation \
+                --command-id "$SETUP_CMD" \
                 --instance-id "$INSTANCE_ID" \
                 --query 'StandardErrorContent' \
                 --output text
               exit 1
             fi
 
+            [ "$i" = "60" ] && { echo "❌ Setup timed out after 15 min"; exit 1; }
+            sleep 15
+          done
+
+          # ── 7b. Pull latest image and restart container ────
+          echo "Updating Docker container..."
+          UPDATE_CMD=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[
+              \"until docker info > /dev/null 2>&1; do sleep 5; done\",
+              \"docker pull $IMAGE\",
+              \"docker stop react-demo || true\",
+              \"docker rm   react-demo || true\",
+              \"docker run -d --name react-demo -p 8080:80 --restart unless-stopped $IMAGE\",
+              \"echo Container updated\"
+            ]" \
+            --comment "Deploy ${{ github.sha }}" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "Update command ID: $UPDATE_CMD"
+
+          for i in $(seq 1 24); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$UPDATE_CMD" \
+              --instance-id "$INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "Attempt $i — Update status: $STATUS"
+
+            if [ "$STATUS" = "Success" ]; then
+              echo "✅ Container updated"
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "❌ Container update failed"
+              aws ssm get-command-invocation \
+                --command-id "$UPDATE_CMD" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'StandardErrorContent' \
+                --output text
+              exit 1
+            fi
+
+            [ "$i" = "24" ] && { echo "❌ Timed out waiting for container update"; exit 1; }
             sleep 5
           done
 
