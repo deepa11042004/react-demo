@@ -177,18 +177,25 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          set -e
+          # Log everything to cloud-init-output.log AND a dedicated file
+          exec > >(tee -a /var/log/userdata.log) 2>&1
+          set -ex
 
-          # Update system
+          echo "=== START: $(date) ==="
+
+          # ── Update system ─────────────────────────────
+          echo ">>> yum update"
           yum update -y
 
           # ── Install Docker ────────────────────────────
+          echo ">>> install docker"
           amazon-linux-extras install docker -y
           systemctl start docker
           systemctl enable docker
           usermod -aG docker ec2-user
 
-          # Run Docker container on port 8080 (nginx on host handles 80/443)
+          # ── Run Docker container on port 8080 ─────────
+          echo ">>> docker pull and run"
           docker pull ${DockerImage}
           docker run -d \
             --name react-demo \
@@ -196,17 +203,19 @@ Resources:
             --restart unless-stopped \
             ${DockerImage}
 
-          # ── Install nginx on host ─────────────────────
+          # ── Install nginx ─────────────────────────────
+          echo ">>> install nginx"
           amazon-linux-extras install nginx1 -y
           systemctl enable nginx
 
-          # ── Install Certbot with Route53 DNS plugin ───
+          # ── Install Certbot ───────────────────────────
+          echo ">>> install certbot"
           amazon-linux-extras install epel -y
           yum install -y python3
           python3 -m pip install certbot certbot-dns-route53
 
-          # Obtain SSL cert via Route53 DNS-01 challenge
-          # (DNS challenge means no HTTP dependency — works even before traffic flows)
+          # ── Get SSL certificate via DNS-01 challenge ──
+          echo ">>> run certbot"
           certbot certonly \
             --dns-route53 \
             --non-interactive \
@@ -216,38 +225,40 @@ Resources:
             --dns-route53-propagation-seconds 60
 
           # ── Configure nginx as SSL reverse proxy ──────
+          echo ">>> configure nginx"
           cat > /etc/nginx/conf.d/react-demo.conf << 'NGINXEOF'
-          server {
-              listen 80;
-              server_name react-demo.bserc.org;
-              return 301 https://$host$request_uri;
-          }
+server {
+    listen 80;
+    server_name react-demo.bserc.org;
+    return 301 https://$host$request_uri;
+}
 
-          server {
-              listen 443 ssl;
-              server_name react-demo.bserc.org;
+server {
+    listen 443 ssl;
+    server_name react-demo.bserc.org;
 
-              ssl_certificate /etc/letsencrypt/live/react-demo.bserc.org/fullchain.pem;
-              ssl_certificate_key /etc/letsencrypt/live/react-demo.bserc.org/privkey.pem;
-              ssl_protocols TLSv1.2 TLSv1.3;
-              ssl_prefer_server_ciphers on;
+    ssl_certificate /etc/letsencrypt/live/react-demo.bserc.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/react-demo.bserc.org/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
 
-              location / {
-                  proxy_pass http://127.0.0.1:8080;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-              }
-          }
-          NGINXEOF
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+NGINXEOF
 
+          nginx -t
           systemctl start nginx
 
           # ── Auto-renew cert daily at 3am ──────────────
           echo "0 3 * * * root certbot renew --quiet && systemctl reload nginx" >> /etc/crontab
 
-          echo "✅ react-demo live on https"
+          echo "=== DONE: $(date) ==="
       Tags:
         - Key: Name
           Value: react-demo-server
