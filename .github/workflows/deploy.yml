@@ -150,7 +150,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --timeout-seconds 900 \
             --parameters "commands=[
-              \"if [ -f $CERT_PATH ] && [ -f $BACKEND_CERT_PATH ] && [ -f $ANALYTICS_CERT_PATH ]; then echo SETUP_DONE; exit 0; fi; echo SETUP_NEEDED; IID=\$(curl -s http://169.254.169.254/latest/meta-data/instance-id); rm -f /var/lib/cloud/instances/\$IID/sem/config-scripts-user; bash /var/lib/cloud/instance/scripts/part-001\"
+              \"if [ -f $CERT_PATH ] && [ -f $BACKEND_CERT_PATH ] && [ -f $ANALYTICS_CERT_PATH ]; then echo SETUP_DONE; exit 0; fi; i=0; while pgrep -f part-001 > /dev/null 2>&1 || pgrep -f certbot > /dev/null 2>&1; do i=\$((i+1)); [ \$i -ge 30 ] && break; echo Waiting for in-progress setup \$i/30; sleep 30; done; if [ -f $CERT_PATH ] && [ -f $BACKEND_CERT_PATH ] && [ -f $ANALYTICS_CERT_PATH ]; then echo SETUP_DONE; exit 0; fi; echo SETUP_NEEDED; IID=\$(curl -s http://169.254.169.254/latest/meta-data/instance-id); rm -f /var/lib/cloud/instances/\$IID/sem/config-scripts-user; bash /var/lib/cloud/instance/scripts/part-001\"
             ]" \
             --comment "Setup check ${{ github.sha }}" \
             --query 'Command.CommandId' \
