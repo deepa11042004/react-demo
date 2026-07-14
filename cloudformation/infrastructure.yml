@@ -1,8 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  React Demo — Full infrastructure stack.
-  Creates VPC, public subnet, EC2 (Docker + nginx + Let's Encrypt SSL),
-  Elastic IP, IAM role for SSM and Route53, and a DNS A record.
+  React Demo — Full infrastructure stack with Auto Scaling and ALB.
+  Creates VPC, two public subnets, ACM SSL certificate, Application Load
+  Balancer with host-based routing, Launch Template, Auto Scaling Group
+  (min 1 / max 3, CPU target-tracking), IAM role for SSM, and Route53
+  Alias records pointing to the ALB.
 
 # ─────────────────────────────────────────────
 # Parameters
@@ -11,42 +13,55 @@ Parameters:
 
   DockerImage:
     Type: String
-    Description: "Docker Hub image to deploy (passed by GitHub Actions CI/CD)"
+    Description: "Frontend Docker Hub image (passed by GitHub Actions)"
+
+  BackendDockerImage:
+    Type: String
+    Description: "Backend API Docker Hub image (passed by GitHub Actions)"
+
+  AnalyticsDockerImage:
+    Type: String
+    Description: "Analytics service Docker Hub image (passed by GitHub Actions)"
 
   DomainName:
     Type: String
     Default: react-demo.bserc.org
-    Description: "Subdomain for the website (must belong to the HostedZoneId zone)"
+    Description: "Frontend subdomain"
+
+  BackendDomainName:
+    Type: String
+    Default: api.react-demo.bserc.org
+    Description: "Backend API subdomain"
+
+  AnalyticsDomainName:
+    Type: String
+    Default: analytics.react-demo.bserc.org
+    Description: "Analytics service subdomain"
 
   HostedZoneId:
     Type: String
     Default: Z01291282OIN72SISEYSR
     Description: "Route53 Hosted Zone ID for the parent domain"
 
-  CertbotEmail:
-    Type: String
-    Default: peltowninfra@gmail.com
-    Description: "Email address for Let's Encrypt certificate expiry notifications"
-
   InstanceType:
     Type: String
     Default: t2.small
     Description: "EC2 instance type"
 
-  BackendDomainName:
-    Type: String
-    Default: api.react-demo.bserc.org
-    Description: "Subdomain for the backend API"
+  MinCapacity:
+    Type: Number
+    Default: 1
+    Description: "Minimum number of EC2 instances in the ASG"
 
-  AnalyticsDomainName:
-    Type: String
-    Default: analytics.react-demo.bserc.org
-    Description: "Subdomain for the analytics service"
+  MaxCapacity:
+    Type: Number
+    Default: 3
+    Description: "Maximum number of EC2 instances in the ASG"
 
   KeyPairName:
     Type: String
     Default: ''
-    Description: "EC2 Key Pair for SSH access (optional — SSM is preferred for deployments)"
+    Description: "EC2 Key Pair for SSH access (optional — SSM is preferred)"
 
 # ─────────────────────────────────────────────
 # Conditions
@@ -60,6 +75,7 @@ Conditions:
 Resources:
 
   # ── Networking ──────────────────────────────
+  # Two subnets in different AZs — required by the Application Load Balancer.
 
   VPC:
     Type: AWS::EC2::VPC
@@ -93,7 +109,18 @@ Resources:
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
-          Value: react-demo-public-subnet
+          Value: react-demo-subnet-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: react-demo-subnet-2
 
   RouteTable:
     Type: AWS::EC2::RouteTable
@@ -117,12 +144,18 @@ Resources:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref RouteTable
 
-  # ── Security Group ───────────────────────────
+  SubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref RouteTable
 
-  SecurityGroup:
+  # ── Security Groups ──────────────────────────
+
+  ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTP, HTTPS and SSH inbound traffic
+      GroupDescription: Allow HTTP and HTTPS inbound to ALB
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -135,23 +168,73 @@ Resources:
           ToPort: 443
           CidrIp: 0.0.0.0/0
           Description: HTTPS
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: react-demo-alb-sg
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 instances — accept container traffic from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
           CidrIp: 0.0.0.0/0
           Description: SSH (optional, SSM is preferred)
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Frontend from ALB
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3001
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Backend API from ALB
+        - IpProtocol: tcp
+          FromPort: 3002
+          ToPort: 3002
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Analytics from ALB
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
-          Description: Allow all outbound
       Tags:
         - Key: Name
-          Value: react-demo-sg
+          Value: react-demo-ec2-sg
+
+  # ── ACM Certificate ──────────────────────────
+  # Single certificate covering all three subdomains.
+  # CloudFormation automatically creates the Route53 DNS validation records
+  # and waits for the certificate to be issued before continuing.
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Ref BackendDomainName
+        - !Ref AnalyticsDomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+        - DomainName: !Ref BackendDomainName
+          HostedZoneId: !Ref HostedZoneId
+        - DomainName: !Ref AnalyticsDomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Name
+          Value: react-demo-cert
 
   # ── IAM Role ─────────────────────────────────
-  # Grants the EC2 instance:
-  #   • SSM core access  — so GitHub Actions can run remote commands without SSH
-  #   • Route53 access   — so Certbot can complete the DNS-01 challenge for SSL
+  # Grants SSM core access — enables GitHub Actions to run remote commands
+  # on EC2 instances without requiring SSH access or key pairs.
 
   EC2Role:
     Type: AWS::IAM::Role
@@ -166,17 +249,6 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-      Policies:
-        - PolicyName: CertbotRoute53Policy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - route53:ListHostedZones
-                  - route53:GetChange
-                  - route53:ChangeResourceRecordSets
-                Resource: '*'
       Tags:
         - Key: Name
           Value: react-demo-ec2-role
@@ -187,170 +259,248 @@ Resources:
       Roles:
         - !Ref EC2Role
 
-  # ── EC2 Instance ─────────────────────────────
+  # ── Target Groups ────────────────────────────
+  # One per service. The ALB forwards to each based on the Host header.
+  # Health checks hit each container's port directly on the EC2 instance.
 
-  EC2Instance:
-    Type: AWS::EC2::Instance
+  TargetGroupFrontend:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
-      InstanceType: !Ref InstanceType
-      IamInstanceProfile: !Ref EC2InstanceProfile
-      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
-      NetworkInterfaces:
-        - DeviceIndex: 0
-          AssociatePublicIpAddress: true
-          SubnetId: !Ref PublicSubnet
-          GroupSet:
-            - !Ref SecurityGroup
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash
-          set -ex
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 8080
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Tags:
+        - Key: Name
+          Value: react-demo-tg-frontend
 
-          echo "=== START: $(date) ==="
+  TargetGroupApi:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 3001
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Tags:
+        - Key: Name
+          Value: react-demo-tg-api
 
-          # ── Update system ──────────────────────────────
-          echo ">>> yum update"
-          yum update -y
+  TargetGroupAnalytics:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 3002
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Tags:
+        - Key: Name
+          Value: react-demo-tg-analytics
 
-          # ── Install Docker ─────────────────────────────
-          echo ">>> install docker"
-          amazon-linux-extras install docker -y
-          systemctl start docker
-          systemctl enable docker
-          usermod -aG docker ec2-user
+  # ── Application Load Balancer ────────────────
 
-          # ── Pull and start the application container ───
-          echo ">>> docker pull and run"
-          docker pull ${DockerImage}
-          docker stop react-demo || true
-          docker rm   react-demo || true
-          docker run -d \
-            --name react-demo \
-            -p 8080:80 \
-            --restart unless-stopped \
-            ${DockerImage}
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: AttachGateway
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: react-demo-alb
 
-          # ── Install nginx ──────────────────────────────
-          echo ">>> install nginx"
-          amazon-linux-extras install nginx1 -y
-          systemctl enable nginx
+  # HTTP → HTTPS redirect
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: '443'
+            StatusCode: HTTP_301
 
-          # ── Install Certbot ────────────────────────────
-          # urllib3 pinned to <1.27: Python 3.7 on Amazon Linux 2 uses
-          # OpenSSL 1.0.2k which is incompatible with urllib3 v2.x
-          echo ">>> install certbot"
-          amazon-linux-extras install epel -y
-          yum install -y python3
-          python3 -m pip install certbot certbot-dns-route53 "urllib3>=1.25.4,<1.27"
+  # HTTPS listener — default forwards to frontend
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref Certificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupFrontend
 
-          # ── Obtain SSL certificates via Route53 DNS-01 challenge ──
-          echo ">>> run certbot (frontend)"
-          certbot certonly \
-            --dns-route53 \
-            --non-interactive \
-            --agree-tos \
-            --email ${CertbotEmail} \
-            -d ${DomainName} \
-            --dns-route53-propagation-seconds 60
+  # Host-based routing rules
+  APIListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 1
+      Conditions:
+        - Field: host-header
+          Values:
+            - !Ref BackendDomainName
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupApi
 
-          echo ">>> run certbot (backend)"
-          certbot certonly \
-            --dns-route53 \
-            --non-interactive \
-            --agree-tos \
-            --email ${CertbotEmail} \
-            -d ${BackendDomainName} \
-            --dns-route53-propagation-seconds 60
+  AnalyticsListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 2
+      Conditions:
+        - Field: host-header
+          Values:
+            - !Ref AnalyticsDomainName
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupAnalytics
 
-          echo ">>> run certbot (analytics)"
-          certbot certonly \
-            --dns-route53 \
-            --non-interactive \
-            --agree-tos \
-            --email ${CertbotEmail} \
-            -d ${AnalyticsDomainName} \
-            --dns-route53-propagation-seconds 60
+  # ── Launch Template ──────────────────────────
+  # UserData is simplified — no nginx or certbot needed.
+  # The ALB terminates SSL and routes by Host header directly to container ports.
 
-          # ── Configure nginx as SSL reverse proxy ───────
-          echo ">>> configure nginx"
-          cat > /etc/nginx/conf.d/react-demo.conf << 'NGINXEOF'
-          server {
-              listen 80;
-              server_name ${DomainName} ${BackendDomainName} ${AnalyticsDomainName};
-              return 301 https://$host$request_uri;
-          }
-          server {
-              listen 443 ssl;
-              server_name ${DomainName};
-              ssl_certificate /etc/letsencrypt/live/${DomainName}/fullchain.pem;
-              ssl_certificate_key /etc/letsencrypt/live/${DomainName}/privkey.pem;
-              ssl_protocols TLSv1.2 TLSv1.3;
-              ssl_prefer_server_ciphers on;
-              location / {
-                  proxy_pass http://127.0.0.1:8080;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-              }
-          }
-          server {
-              listen 443 ssl;
-              server_name ${BackendDomainName};
-              ssl_certificate /etc/letsencrypt/live/${BackendDomainName}/fullchain.pem;
-              ssl_certificate_key /etc/letsencrypt/live/${BackendDomainName}/privkey.pem;
-              ssl_protocols TLSv1.2 TLSv1.3;
-              ssl_prefer_server_ciphers on;
-              location / {
-                  proxy_pass http://127.0.0.1:3001;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-              }
-          }
-          server {
-              listen 443 ssl;
-              server_name ${AnalyticsDomainName};
-              ssl_certificate /etc/letsencrypt/live/${AnalyticsDomainName}/fullchain.pem;
-              ssl_certificate_key /etc/letsencrypt/live/${AnalyticsDomainName}/privkey.pem;
-              ssl_protocols TLSv1.2 TLSv1.3;
-              ssl_prefer_server_ciphers on;
-              location / {
-                  proxy_pass http://127.0.0.1:3002;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-              }
-          }
-          NGINXEOF
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: react-demo-lt
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: react-demo-server
+              - Key: Project
+                Value: react-demo
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ex
 
-          nginx -t
-          systemctl restart nginx
+            echo "=== START: $(date) ==="
 
-          # ── Schedule daily certificate renewal ─────────
-          echo "0 3 * * * root certbot renew --quiet && systemctl reload nginx" >> /etc/crontab
+            # ── Update system ──────────────────────────────
+            yum update -y
 
-          echo "=== DONE: $(date) ==="
+            # ── Install Docker ─────────────────────────────
+            amazon-linux-extras install docker -y
+            systemctl start docker
+            systemctl enable docker
+            usermod -aG docker ec2-user
+
+            # ── Frontend container ─────────────────────────
+            echo ">>> start frontend"
+            docker pull ${DockerImage}
+            docker stop react-demo || true
+            docker rm   react-demo || true
+            docker run -d \
+              --name react-demo \
+              -p 8080:80 \
+              --restart unless-stopped \
+              ${DockerImage}
+
+            # ── Backend API container ──────────────────────
+            echo ">>> start backend api"
+            if docker pull ${BackendDockerImage}; then
+              docker stop nexus-api || true
+              docker rm   nexus-api || true
+              docker run -d \
+                --name nexus-api \
+                -p 3001:3001 \
+                --restart unless-stopped \
+                ${BackendDockerImage}
+            fi
+
+            # ── Analytics container ────────────────────────
+            echo ">>> start analytics"
+            if docker pull ${AnalyticsDockerImage}; then
+              docker stop nexus-analytics || true
+              docker rm   nexus-analytics || true
+              docker run -d \
+                --name nexus-analytics \
+                -p 3002:3002 \
+                --restart unless-stopped \
+                ${AnalyticsDockerImage}
+            fi
+
+            echo "=== DONE: $(date) ==="
+
+  # ── Auto Scaling Group ───────────────────────
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: AttachGateway
+    Properties:
+      AutoScalingGroupName: react-demo-asg
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      DesiredCapacity: !Ref MinCapacity
+      TargetGroupARNs:
+        - !Ref TargetGroupFrontend
+        - !Ref TargetGroupApi
+        - !Ref TargetGroupAnalytics
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
       Tags:
         - Key: Name
           Value: react-demo-server
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: react-demo
+          PropagateAtLaunch: true
 
-  # ── Elastic IP ───────────────────────────────
+  # ── Auto Scaling Policy ──────────────────────
+  # Target tracking at 70% avg CPU — AWS automatically adds/removes instances.
 
-  ElasticIP:
-    Type: AWS::EC2::EIP
-    DependsOn: AttachGateway
+  ScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
     Properties:
-      Domain: vpc
-      InstanceId: !Ref EC2Instance
-      Tags:
-        - Key: Name
-          Value: react-demo-eip
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70
 
-  # ── Route53 A Records ────────────────────────
+  # ── Route53 Alias Records → ALB ──────────────
+  # All three subdomains point to the same ALB.
+  # The ALB uses the Host header to route to the correct target group.
 
   DNSRecord:
     Type: AWS::Route53::RecordSet
@@ -358,9 +508,10 @@ Resources:
       HostedZoneId: !Ref HostedZoneId
       Name: !Ref DomainName
       Type: A
-      TTL: '60'
-      ResourceRecords:
-        - !Ref ElasticIP
+      AliasTarget:
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+        EvaluateTargetHealth: true
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
 
   DNSRecordBackend:
     Type: AWS::Route53::RecordSet
@@ -368,9 +519,10 @@ Resources:
       HostedZoneId: !Ref HostedZoneId
       Name: !Ref BackendDomainName
       Type: A
-      TTL: '60'
-      ResourceRecords:
-        - !Ref ElasticIP
+      AliasTarget:
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+        EvaluateTargetHealth: true
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
 
   DNSRecordAnalytics:
     Type: AWS::Route53::RecordSet
@@ -378,9 +530,10 @@ Resources:
       HostedZoneId: !Ref HostedZoneId
       Name: !Ref AnalyticsDomainName
       Type: A
-      TTL: '60'
-      ResourceRecords:
-        - !Ref ElasticIP
+      AliasTarget:
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+        EvaluateTargetHealth: true
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
 
 # ─────────────────────────────────────────────
 # Outputs
@@ -391,12 +544,12 @@ Outputs:
     Description: Public HTTPS URL of the website
     Value: !Sub 'https://${DomainName}'
 
-  PublicIP:
-    Description: Elastic IP address
-    Value: !Ref ElasticIP
+  ALBDNSName:
+    Description: Application Load Balancer DNS name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
 
-  InstanceId:
-    Description: EC2 Instance ID (used by GitHub Actions for SSM commands)
-    Value: !Ref EC2Instance
+  AutoScalingGroupName:
+    Description: ASG name — used by backend/analytics pipelines for SSM targeting
+    Value: !Ref AutoScalingGroup
     Export:
-      Name: ReactDemoInstanceId
+      Name: ReactDemoASGName
