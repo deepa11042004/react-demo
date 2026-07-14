@@ -390,6 +390,8 @@ Resources:
       LaunchTemplateData:
         ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
         InstanceType: !Ref InstanceType
+        Monitoring:
+          Enabled: true
         IamInstanceProfile:
           Arn: !GetAtt EC2InstanceProfile.Arn
         KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
