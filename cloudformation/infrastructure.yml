@@ -178,7 +178,7 @@ Resources:
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: EC2 instances — accept container traffic from ALB only
+      GroupDescription: EC2 instances - accept container traffic from ALB only
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
